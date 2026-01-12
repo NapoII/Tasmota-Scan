@@ -1,0 +1,50 @@
+# ==============================
+# Python
+# ==============================
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# Packaging / build
+build/
+dist/
+*.egg-info/
+
+# Test / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# IDEs
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# ==============================
+# Project-specific outputs
+# ==============================
+# Per-device logs
+/data/
+Tasmota-Scan/data
+
+# Generated plots
+*.png
+
+# Legacy / consolidated logs (if still present)
+tasmota_cost_log.json
+Tasmota-Scan\tasmota_cost_plot.png
+# Backups / dumps
+Tasmota_config_backup/
+*.dmp
+
+# Local scratch files
+*.log
+*.tmp
