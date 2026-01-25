@@ -134,7 +134,10 @@ def _parse_iso_ts(value):
     if not value:
         return None
     try:
-        return datetime.fromisoformat(str(value))
+        dt = datetime.fromisoformat(str(value))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
     except ValueError:
         return None
 
@@ -256,6 +259,162 @@ def save_device_log(path: Path, data):
             f.write("\n")
     except OSError:
         pass
+
+
+def _merge_device_logs(into: dict, other: dict):
+    """Merge two per-device logs (in-place into `into`)."""
+    if not isinstance(into, dict) or not isinstance(other, dict):
+        return into
+
+    into.setdefault("schema_version", 1)
+    other_schema = other.get("schema_version")
+    if isinstance(other_schema, int) and other_schema > int(into.get("schema_version") or 1):
+        into["schema_version"] = other_schema
+
+    into.setdefault("price_eur_per_kwh_default", 0.329)
+    if into.get("price_eur_per_kwh_default") in (None, "N/A") and other.get("price_eur_per_kwh_default") not in (None, "N/A"):
+        into["price_eur_per_kwh_default"] = other.get("price_eur_per_kwh_default")
+
+    into_dev = into.setdefault("device", {})
+    other_dev = other.get("device") or {}
+
+    # Merge timestamps
+    def _min_iso(a, b):
+        da = _parse_iso_ts(a)
+        db = _parse_iso_ts(b)
+        if da is None:
+            return b
+        if db is None:
+            return a
+        return a if da <= db else b
+
+    def _max_iso(a, b):
+        da = _parse_iso_ts(a)
+        db = _parse_iso_ts(b)
+        if da is None:
+            return b
+        if db is None:
+            return a
+        return a if da >= db else b
+
+    if other_dev.get("first_seen"):
+        into_dev["first_seen"] = _min_iso(into_dev.get("first_seen"), other_dev.get("first_seen"))
+    if other_dev.get("last_seen"):
+        into_dev["last_seen"] = _max_iso(into_dev.get("last_seen"), other_dev.get("last_seen"))
+
+    # Prefer existing hostname/name, but fill missing or "Unknown" values.
+    for key in ("hostname", "mac", "module", "version"):
+        if not into_dev.get(key) and other_dev.get(key):
+            into_dev[key] = other_dev.get(key)
+
+    def _is_unknown_name(name):
+        if not name:
+            return True
+        s = str(name).strip().lower()
+        return s.startswith("unknown")
+
+    if _is_unknown_name(into_dev.get("name")) and other_dev.get("name"):
+        into_dev["name"] = other_dev.get("name")
+    elif not into_dev.get("name") and other_dev.get("name"):
+        into_dev["name"] = other_dev.get("name")
+
+    # Merge ip_history
+    into_ips = into_dev.setdefault("ip_history", [])
+    other_ips = other_dev.get("ip_history") or []
+    if isinstance(into_ips, list) and isinstance(other_ips, list):
+        for ip in other_ips:
+            if ip and ip not in into_ips:
+                into_ips.append(ip)
+
+    # Merge baseline (keep earliest baseline_set_at if available)
+    into_base_at = into_dev.get("baseline_set_at")
+    other_base_at = other_dev.get("baseline_set_at")
+    if into_dev.get("baseline_total_kwh") is None and other_dev.get("baseline_total_kwh") is not None:
+        into_dev["baseline_total_kwh"] = other_dev.get("baseline_total_kwh")
+        if other_base_at:
+            into_dev["baseline_set_at"] = other_base_at
+    elif into_dev.get("baseline_total_kwh") is not None and other_dev.get("baseline_total_kwh") is not None:
+        da = _parse_iso_ts(into_base_at)
+        db = _parse_iso_ts(other_base_at)
+        # If other baseline was set earlier, prefer it.
+        if da is None and db is not None:
+            into_dev["baseline_total_kwh"] = other_dev.get("baseline_total_kwh")
+            into_dev["baseline_set_at"] = other_base_at
+        elif da is not None and db is not None and db < da:
+            into_dev["baseline_total_kwh"] = other_dev.get("baseline_total_kwh")
+            into_dev["baseline_set_at"] = other_base_at
+
+    # Merge entries with de-duplication
+    into_entries = into.setdefault("entries", [])
+    other_entries = other.get("entries") or []
+    if not isinstance(into_entries, list):
+        into_entries = []
+        into["entries"] = into_entries
+
+    def _entry_key(e: dict):
+        ts = (e.get("ts") or "").strip()
+        ip = (e.get("ip") or "").strip()
+        total = e.get("total_kwh")
+        if isinstance(total, float):
+            total = round(total, 6)
+        return (ts, ip, total)
+
+    merged = {}
+    for e in into_entries:
+        if isinstance(e, dict):
+            merged[_entry_key(e)] = dict(e)
+    for e in other_entries:
+        if not isinstance(e, dict):
+            continue
+        key = _entry_key(e)
+        if key not in merged:
+            merged[key] = dict(e)
+        else:
+            # Fill missing fields
+            existing = merged[key]
+            for k, v in e.items():
+                if existing.get(k) is None and v is not None:
+                    existing[k] = v
+
+    entries_out = list(merged.values())
+    entries_out.sort(key=lambda x: (_parse_iso_ts(x.get("ts")) or datetime.min.replace(tzinfo=timezone.utc)))
+    into["entries"] = entries_out
+    return into
+
+
+def _archive_path(path: Path, suffix: str = ".bak"):
+    candidate = path.with_name(path.name + suffix)
+    i = 1
+    while candidate.exists():
+        candidate = path.with_name(path.name + suffix + f".{i}")
+        i += 1
+    return candidate
+
+
+def _merge_legacy_logs_into(canonical_path: Path, legacy_paths: list[Path]):
+    if not legacy_paths:
+        return False
+
+    main_log = load_device_log(canonical_path)
+    changed = False
+    for legacy in legacy_paths:
+        try:
+            legacy_log = load_device_log(legacy)
+        except Exception:
+            continue
+        _merge_device_logs(main_log, legacy_log)
+        changed = True
+
+    if changed:
+        save_device_log(canonical_path, main_log)
+
+        # Archive legacy files so we don't keep producing duplicates.
+        for legacy in legacy_paths:
+            try:
+                legacy.rename(_archive_path(legacy))
+            except OSError:
+                pass
+    return changed
 
 
 def log_device_snapshot(device_log, device_info, energy_data, preis_prokw, state_data=None):
@@ -531,14 +690,12 @@ def scan_network(plot: bool = True):
                 mac = _normalize_mac(device_info.get("mac"))
                 stem = _safe_filename(hostname, fallback=(mac or device_info.get("ip") or "device"))
 
-                # If two devices share a hostname, disambiguate by MAC.
-                filename = f"{stem}.json"
-                if mac and stem.upper() == mac.upper().replace(":", ""):
-                    filename = f"{stem}.json"
-                elif mac:
-                    filename = f"{stem}__{mac.replace(':', '')}.json"
+                # Canonical log filename is ALWAYS Hostname.json (no __MAC).
+                # Any legacy Hostname__*.json files are merged and archived.
+                device_log_path = DATA_DIR / f"{stem}.json"
+                legacy_paths = list(DATA_DIR.glob(f"{stem}__*.json"))
+                _merge_legacy_logs_into(device_log_path, legacy_paths)
 
-                device_log_path = DATA_DIR / filename
                 device_log = load_device_log(device_log_path)
                 log_device_snapshot(device_log, device_info, energy_data, preis_prokw=0.329, state_data=state_data)
                 save_device_log(device_log_path, device_log)
